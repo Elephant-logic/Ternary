@@ -1,16 +1,20 @@
 """Runtime persistence for diskless/free deployments.
 
-Local state remains plain JSON. When Upstash REST credentials are present, a
+Local state remains plain JSON. When GitHub state credentials are present, a
 single versioned JSON snapshot containing AppState + the event journal is copied
-to durable remote storage and restored before the service boots.
+to a dedicated GitHub branch and restored before the service boots.
 
 No SQL database is required for this mode.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict
 
@@ -28,53 +32,89 @@ def _atomic_json_write(path: str, obj) -> None:
     os.replace(tmp, path)
 
 
-class UpstashJsonStore:
-    """Dependency-free Upstash REST client storing one JSON string value."""
-    def __init__(self, url: str, token: str, key: str = "ternary:runtime:snapshot"):
-        self.url = url.rstrip("/")
+class GitHubJsonStore:
+    """Dependency-free GitHub Contents API client for one JSON snapshot file."""
+
+    def __init__(self, token: str, repo: str, branch: str = "state",
+                 path: str = "runtime/ternary-state.json"):
         self.token = token
-        self.key = key
+        self.repo = repo
+        self.branch = branch
+        self.path = path
+        encoded_path = urllib.parse.quote(path, safe="/")
+        self.url = f"https://api.github.com/repos/{repo}/contents/{encoded_path}"
 
     @classmethod
     def from_env(cls):
-        url = os.environ.get("UPSTASH_REDIS_REST_URL")
-        token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
-        if not url or not token:
+        token = os.environ.get("GITHUB_STATE_TOKEN")
+        repo = os.environ.get("GITHUB_STATE_REPO")
+        if not token or not repo:
             return None
-        return cls(url, token, os.environ.get("TERN_REMOTE_STATE_KEY", "ternary:runtime:snapshot"))
+        return cls(
+            token,
+            repo,
+            os.environ.get("GITHUB_STATE_BRANCH", "state"),
+            os.environ.get("GITHUB_STATE_PATH", "runtime/ternary-state.json"),
+        )
 
-    def _command(self, parts):
-        body = json.dumps(parts, separators=(",", ":")).encode()
-        req = urllib.request.Request(self.url, data=body, method="POST", headers={
-            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            payload = json.loads(r.read().decode())
-        if "error" in payload:
-            raise RuntimeError(f"remote state store error: {payload['error']}")
-        return payload.get("result")
+    def _request(self, method: str, url: str, body=None):
+        data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "ternary-runtime-state",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+
+    def _metadata(self):
+        url = self.url + "?ref=" + urllib.parse.quote(self.branch, safe="")
+        try:
+            return self._request("GET", url)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
 
     def load(self):
-        raw = self._command(["GET", self.key])
-        if raw is None:
+        meta = self._metadata()
+        if not meta:
             return None
-        if isinstance(raw, dict):
-            return raw
+        raw = base64.b64decode(meta["content"].replace("\n", "")).decode("utf-8")
         return json.loads(raw)
 
     def save(self, snapshot: dict):
         raw = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
-        self._command(["SET", self.key, raw])
+        payload = {
+            "message": "Update Ternary runtime state",
+            "content": base64.b64encode(raw.encode()).decode(),
+            "branch": self.branch,
+        }
+        meta = self._metadata()
+        if meta and meta.get("sha"):
+            payload["sha"] = meta["sha"]
+        self._request("PUT", self.url, payload)
 
 
 class RuntimePersistence:
-    """Coordinates local JSON files and an optional durable remote JSON snapshot."""
+    """Coordinates local JSON files and an optional durable GitHub JSON snapshot."""
+
     def __init__(self, state_path: str, eventlog_path: str, remote=None):
         self.state_path = state_path
         self.eventlog_path = eventlog_path
-        self.remote = remote if remote is not None else UpstashJsonStore.from_env()
+        self.remote = remote if remote is not None else GitHubJsonStore.from_env()
         self.last_error = None
         self.last_saved_ns = None
         self.restored = False
+        self._last_digest = None
+        self.min_save_seconds = max(0, int(os.environ.get("TERN_REMOTE_SAVE_MIN_SECONDS", "300")))
 
     @property
     def remote_enabled(self) -> bool:
@@ -95,23 +135,47 @@ class RuntimePersistence:
             _atomic_json_write(self.state_path, state)
             _atomic_json_write(self.eventlog_path, events)
             self.restored = True
+            self.last_saved_ns = snap.get("saved_at_ns")
+            self._last_digest = self._digest_payload(snap)
             self.last_error = None
             return True
         except Exception as e:
             self.last_error = str(e)
             return False
 
+    def _snapshot(self, state, eventlog) -> dict:
+        sd = asdict(state)
+        sd.pop("path", None)
+        return {
+            "version": SNAPSHOT_VERSION,
+            "saved_at_ns": time.time_ns(),
+            "state": sd,
+            "events": [asdict(e) for e in eventlog.all()],
+            "head": eventlog.head(),
+        }
+
+    @staticmethod
+    def _digest_payload(snapshot: dict) -> str:
+        stable = dict(snapshot)
+        stable.pop("saved_at_ns", None)
+        raw = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(raw).hexdigest()
+
     def save(self, state, eventlog) -> bool:
         if not self.remote_enabled:
             return False
+        now_ns = time.time_ns()
+        if self.last_saved_ns and self.min_save_seconds:
+            if now_ns - self.last_saved_ns < self.min_save_seconds * 1_000_000_000:
+                return True
         try:
-            sd = asdict(state)
-            sd.pop("path", None)
-            snap = {"version": SNAPSHOT_VERSION, "saved_at_ns": time.time_ns(),
-                    "state": sd, "events": [asdict(e) for e in eventlog.all()],
-                    "head": eventlog.head()}
+            snap = self._snapshot(state, eventlog)
+            digest = self._digest_payload(snap)
+            if digest == self._last_digest:
+                return True
             self.remote.save(snap)
             self.last_saved_ns = snap["saved_at_ns"]
+            self._last_digest = digest
             self.last_error = None
             return True
         except Exception as e:
@@ -119,5 +183,11 @@ class RuntimePersistence:
             return False
 
     def status(self) -> dict:
-        return {"remote_json": self.remote_enabled, "restored_from_remote": self.restored,
-                "last_saved_ns": self.last_saved_ns, "error": self.last_error}
+        return {
+            "remote_json": self.remote_enabled,
+            "remote_backend": "github" if self.remote_enabled else None,
+            "restored_from_remote": self.restored,
+            "last_saved_ns": self.last_saved_ns,
+            "min_save_seconds": self.min_save_seconds,
+            "error": self.last_error,
+        }
