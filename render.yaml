@@ -24,8 +24,6 @@ services:
         sync: false
 
       # Durable no-SQL JSON snapshot stored in GitHub.
-      # Create a fine-grained GitHub token with Contents: Read and write for
-      # the state repository, then paste it into Render when prompted.
       - key: GITHUB_STATE_TOKEN
         sync: false
       - key: GITHUB_STATE_REPO
@@ -36,6 +34,13 @@ services:
         value: runtime/ternary-state.json
       - key: TERN_REMOTE_SAVE_MIN_SECONDS
         value: "300"
+
+      # Optional server-side chat LLM. The key stays on Render and is never sent
+      # to the browser or written into the runtime JSON snapshot.
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5-mini
 
       # LIVE credentials intentionally remain unset for this PAPER/free profile.
       # - key: TERN_LIVE_API_KEY
