@@ -1,0 +1,45 @@
+# Render Blueprint for Ternary.
+# Safe defaults: PAPER mode, synthetic data, no exchange/LLM credentials required.
+# Import this repo with Render -> New -> Blueprint, or use the Deploy to Render button.
+
+services:
+  - type: web
+    name: ternary-control
+    runtime: python
+    plan: starter
+    autoDeployTrigger: commit
+    buildCommand: pip install -r requirements.txt && python -m tests.run_all
+    startCommand: uvicorn service.api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    disk:
+      name: ternary-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TERN_STATE
+        value: /var/data/state.json
+      - key: TERN_EVENTLOG
+        value: /var/data/eventlog.db
+      - key: TERN_AUTOSTART
+        value: "1"
+      - key: TERN_MODE
+        value: PAPER
+      - key: TERN_CONTROL_TOKEN
+        sync: false
+
+      # Optional signed audit-head checkpoints. For meaningful tamper resistance,
+      # anchor these outside this service/trust domain before unrestricted LIVE use.
+      # - key: TERN_AUDIT_CHECKPOINT_PATH
+      #   value: /var/data/audit-heads.jsonl
+      # - key: TERN_AUDIT_SIGNING_KEY
+      #   sync: false
+
+      # LIVE credentials — intentionally unset in the Blueprint.
+      # - key: TERN_LIVE_API_KEY
+      #   sync: false
+      # - key: TERN_LIVE_API_SECRET
+      #   sync: false
+
+      # Optional server-side LLM key — never expose this in browser JS.
+      # - key: OPENAI_API_KEY
+      #   sync: false
