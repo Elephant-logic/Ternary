@@ -1,6 +1,6 @@
 # Render FREE Blueprint for Ternary.
 # No SQL and no persistent Render disk: runtime state/event history are JSON.
-# The override layer is copied over the checksum-verified source bundle at build.
+# Durable snapshots are written to a dedicated GitHub branch.
 
 services:
   - type: web
@@ -23,14 +23,19 @@ services:
       - key: TERN_CONTROL_TOKEN
         sync: false
 
-      # Durable no-SQL JSON snapshot. Create a free Upstash Redis database and
-      # paste its REST credentials when Render prompts during Blueprint import.
-      - key: UPSTASH_REDIS_REST_URL
+      # Durable no-SQL JSON snapshot stored in GitHub.
+      # Create a fine-grained GitHub token with Contents: Read and write for
+      # the state repository, then paste it into Render when prompted.
+      - key: GITHUB_STATE_TOKEN
         sync: false
-      - key: UPSTASH_REDIS_REST_TOKEN
-        sync: false
-      - key: TERN_REMOTE_STATE_KEY
-        value: ternary:paper:runtime:v1
+      - key: GITHUB_STATE_REPO
+        value: Elephant-logic/Ternary
+      - key: GITHUB_STATE_BRANCH
+        value: state
+      - key: GITHUB_STATE_PATH
+        value: runtime/ternary-state.json
+      - key: TERN_REMOTE_SAVE_MIN_SECONDS
+        value: "300"
 
       # LIVE credentials intentionally remain unset for this PAPER/free profile.
       # - key: TERN_LIVE_API_KEY
