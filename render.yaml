@@ -1,6 +1,5 @@
 # Render Blueprint for Ternary.
 # Safe defaults: PAPER mode, synthetic data, no exchange/LLM credentials required.
-# Import this repo with Render -> New -> Blueprint, or use the Deploy to Render button.
 
 services:
   - type: web
@@ -8,8 +7,15 @@ services:
     runtime: python
     plan: starter
     autoDeployTrigger: commit
-    buildCommand: pip install -r requirements.txt && python -m tests.run_all
-    startCommand: uvicorn service.api:app --host 0.0.0.0 --port $PORT
+    buildCommand: >-
+      rm -rf .render_src &&
+      mkdir -p .render_src &&
+      cat bundle/xzchunk*.b64 | base64 -d > /tmp/ternary-src.tar.xz &&
+      tar -xJf /tmp/ternary-src.tar.xz -C .render_src &&
+      cd .render_src &&
+      pip install -r requirements.txt &&
+      python -m tests.run_all
+    startCommand: cd .render_src && uvicorn service.api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     disk:
       name: ternary-data
