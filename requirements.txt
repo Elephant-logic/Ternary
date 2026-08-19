@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+# Phase 2 (live adapters) — uncomment when wiring real exchanges/data:
+# ccxt==4.4.0
+# httpx==0.27.2
+# LLM chat (optional, server-side only):
+# openai==1.51.0
