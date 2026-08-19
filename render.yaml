@@ -9,7 +9,7 @@ services:
     plan: free
     autoDeployTrigger: commit
     buildCommand: python unpack_bundle.py && cp -R overrides/. .render_src/ && cd .render_src && pip install -r requirements.txt && python -m tests.run_all
-    startCommand: cd .render_src && uvicorn service.marketchat:app --host 0.0.0.0 --port $PORT
+    startCommand: cd .render_src && uvicorn service.finalfix:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: TERN_STATE
@@ -35,7 +35,8 @@ services:
       - key: TERN_REMOTE_SAVE_MIN_SECONDS
         value: "300"
 
-      # Optional server-side chat LLM. The key stays on Render and is never sent
+      # Server-side OpenAI is used by both read-only market chat and the bounded
+      # governed AI risk-review stage. The key stays on Render and is never sent
       # to the browser or written into the runtime JSON snapshot.
       - key: OPENAI_API_KEY
         sync: false
