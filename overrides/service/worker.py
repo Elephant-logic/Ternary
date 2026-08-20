@@ -54,17 +54,17 @@ class Worker:
     def kill(self,reason="manual"):
         with self._lock:
             self.gw.kill(reason)
-            if self.persistence: self.persistence.save(self.state,self.log)
+            if self.persistence: self.persistence.save(self.state,self.log,force=True)
     def reset_kill(self,reason="manual"):
         with self._lock:
             self.gw.reset_kill(reason)
-            if self.persistence: self.persistence.save(self.state,self.log)
+            if self.persistence: self.persistence.save(self.state,self.log,force=True)
     def apply_settings(self):
         with self._lock:
             self.log.append("CONFIG_CHANGE",{"component":"worker","change":"settings_applied","mode":self.state.mode,"goals":self.state.goals,"data":self.state.data_source,"broker":self.state.broker})
             self._rebuild()
             self._ensure_live_paper_boundary()
-            if self.persistence: self.persistence.save(self.state,self.log)
+            if self.persistence: self.persistence.save(self.state,self.log,force=True)
     def status(self):
         with self._lock:
             market_health={}
@@ -80,6 +80,8 @@ class Worker:
                     "market_health":market_health,
                     "rotation_enabled":bool(self.state.goals.get("rotation_enabled",True)),
                     "max_exposure_pct":float(self.state.goals.get("max_exposure_pct",0.60)),
+                    "paper_universe_mode":self.state.goals.get("paper_universe_mode"),
+                    "universe_count":len(self.state.goals.get("universe") or []),
                     "persistence":self.persistence.status() if self.persistence else {"remote_json":False}}
 
     def _tick_source_ts(self):
@@ -136,10 +138,11 @@ class Worker:
                             continue
                         self._publish_runtime_portfolio()
                         out=self.orch.run_cycle(ts,self.book); self._cycle+=1
-                        self.last={"cycle":self._cycle,"equity":round(out.get("equity",0),2),"halted":out.get("halted",False),"ts":ts,"fills":len(out.get("fills",[])),"drift":out.get("drift",{}),"data_health":health}
+                        fills=out.get("fills",[]) or []
+                        self.last={"cycle":self._cycle,"equity":round(out.get("equity",0),2),"halted":out.get("halted",False),"ts":ts,"fills":len(fills),"drift":out.get("drift",{}),"data_health":health}
                         cp=os.environ.get("TERN_AUDIT_CHECKPOINT_PATH"); ck=os.environ.get("TERN_AUDIT_SIGNING_KEY")
                         if cp and ck: self.log.checkpoint(cp,ck)
-                        if self.persistence: self.persistence.save(self.state,self.log)
+                        if self.persistence: self.persistence.save(self.state,self.log,force=bool(fills))
                 else:
                     with self._lock:
                         self.last["data_health"]=health
