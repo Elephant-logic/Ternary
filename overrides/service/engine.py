@@ -127,7 +127,7 @@ def build_engine(state: AppState, eventlog: EventLog, ai_adapter=None):
 
     if ai_adapter is None:
         from service.openai_risk import make_openai_risk_adapter
-        ai_adapter = make_openai_risk_adapter()
+        ai_adapter = make_openai_risk_adapter(state)
     if ai_adapter is None:
         def ai_adapter(facts):
             return {"verdict": "VETO", "confidence": 0.0,
