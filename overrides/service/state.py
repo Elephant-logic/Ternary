@@ -15,6 +15,10 @@ DEFAULT_GOALS = {
     "max_positions": 5, "max_position_pct": 0.12, "max_exposure_pct": 0.60,
     "turnover": "low", "universe": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
     "timeframes": ["1h", "1d"],
+    # When exposure is near its ceiling, the optimiser may rebalance away from
+    # holdings that are no longer among the highest-ranked mechanical candidates.
+    # Rotation is deliberately limited per cycle to reduce churn.
+    "rotation_enabled": True, "rotation_max_per_cycle": 1,
 }
 PRESETS = {
     "conservative": {"max_drawdown": 0.08, "max_daily_loss": 0.02, "max_positions": 3,
@@ -38,6 +42,12 @@ def validate_goals(g: dict) -> tuple[dict, list]:
         if c != v: warns.append(f"{k} {v} clamped to {c}")
         out[k] = c
     out["max_positions"] = int(_clamp(int(out.get("max_positions", 5)), 1, 20))
+    out["rotation_enabled"] = bool(out.get("rotation_enabled", True))
+    try:
+        rmax = int(out.get("rotation_max_per_cycle", 1))
+    except Exception:
+        rmax = 1
+    out["rotation_max_per_cycle"] = int(_clamp(rmax, 1, 3))
     if out.get("turnover") not in TURNOVER_CAP:
         out["turnover"] = "low"; warns.append("turnover reset to 'low'")
     return out, warns
@@ -68,6 +78,8 @@ class AppState:
         else:
             s = cls(path=path)
             s.save()
+        # Normalise newly-added settings for old persisted state files.
+        s.goals, _ = validate_goals(s.goals)
         # Render's hosted PAPER profile can opt into real public candles without
         # affecting deterministic tests/backtests. This is runtime-only policy:
         # real market data + simulated broker/fake funds.
