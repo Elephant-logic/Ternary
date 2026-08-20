@@ -1,11 +1,10 @@
 """Real OpenAI-backed adapter for Ternary's governed AI risk-review seam.
 
-The adapter can only TAKE, REDUCE, DELAY, or VETO. It applies a persistent
-hourly request budget and an in-memory material-risk cache so repeated reviews of
-the same symbol/side do not waste API calls when the risk picture is effectively
-unchanged. In PAPER mode only, an exhausted test budget explicitly falls back to
-the deterministic mechanical/risk-gateway path without increasing size. LIVE
-mode and API/network failures remain fail-closed.
+The adapter can only TAKE, REDUCE, DELAY, or VETO. Fresh OpenAI reviews are
+bounded by an hourly budget, paced across the hour, and cached by materially
+normalised risk facts so repeated reviews do not waste calls. PAPER may continue
+through the deterministic gateway when a paced slot or test budget is unavailable;
+LIVE remains fail-closed.
 """
 from __future__ import annotations
 
@@ -58,19 +57,31 @@ def _usage_dict(state, model: str):
     u = dict(goals.get("ai_usage") or {})
     if u.get("day") != day:
         u.update({
-            "day": day, "calls_today": 0, "cache_hits_today": 0,
+            "day": day,
+            "calls_today": 0,
+            "cache_hits_today": 0,
             "budget_bypasses_today": 0,
-            "input_tokens_today": 0, "output_tokens_today": 0,
+            "pace_bypasses_today": 0,
+            "input_tokens_today": 0,
+            "output_tokens_today": 0,
             "estimated_cost_usd_today": 0.0,
         })
     if u.get("hour") != hour:
-        u.update({"hour": hour, "calls_this_hour": 0, "cache_hits_this_hour": 0,
-                  "budget_bypasses_this_hour": 0})
-    for k in ("calls_today", "calls_this_hour", "cache_hits_today", "cache_hits_this_hour",
-              "budget_bypasses_today", "budget_bypasses_this_hour",
-              "input_tokens_today", "output_tokens_today"):
+        u.update({
+            "hour": hour,
+            "calls_this_hour": 0,
+            "cache_hits_this_hour": 0,
+            "budget_bypasses_this_hour": 0,
+            "pace_bypasses_this_hour": 0,
+        })
+    for k in (
+        "calls_today", "calls_this_hour", "cache_hits_today", "cache_hits_this_hour",
+        "budget_bypasses_today", "budget_bypasses_this_hour", "pace_bypasses_today",
+        "pace_bypasses_this_hour", "input_tokens_today", "output_tokens_today",
+    ):
         u.setdefault(k, 0)
     u.setdefault("estimated_cost_usd_today", 0.0)
+    u.setdefault("last_fresh_call_epoch", 0.0)
     u["model"] = model
     return u
 
@@ -94,7 +105,6 @@ def _round_sig(value: float, sig: int = 3):
 
 
 def _normalise_material(value, key: str = ""):
-    """Remove purely volatile identifiers and smooth immaterial numeric noise."""
     if isinstance(value, dict):
         out = {}
         for k, v in sorted(value.items(), key=lambda kv: str(kv[0])):
@@ -128,6 +138,30 @@ def _cache_key(facts: dict):
     return f"{symbol}|{side}|{hashlib.sha256(raw).hexdigest()}"
 
 
+def _policy_values(state, default_budget: int):
+    goals = getattr(state, "goals", {}) if state is not None else {}
+    try:
+        max_calls = int(goals.get("ai_risk_max_calls_per_hour", default_budget))
+    except Exception:
+        max_calls = default_budget
+    max_calls = max(0, min(max_calls, 500))
+    try:
+        override = int(goals.get("ai_risk_min_interval_seconds", 0))
+    except Exception:
+        override = 0
+    override = max(0, min(override, 3600))
+    if override > 0:
+        spacing = override
+        mode = "custom"
+    elif max_calls > 0:
+        spacing = max(1, math.ceil(3600 / max_calls))
+        mode = "auto"
+    else:
+        spacing = 3600
+        mode = "auto"
+    return max_calls, override, spacing, mode
+
+
 def risk_usage_status():
     adapter = _ACTIVE_ADAPTER
     if adapter is None:
@@ -135,8 +169,12 @@ def risk_usage_status():
             "enabled": False, "max_calls_per_hour": 0, "calls_this_hour": 0,
             "calls_remaining": 0, "calls_today": 0, "cache_hits_today": 0,
             "cache_hits_this_hour": 0, "budget_bypasses_today": 0,
-            "budget_bypasses_this_hour": 0, "cache_ttl_s": 0, "input_tokens_today": 0,
-            "output_tokens_today": 0, "estimated_cost_usd_today": 0.0, "model": None,
+            "budget_bypasses_this_hour": 0, "pace_bypasses_today": 0,
+            "pace_bypasses_this_hour": 0, "min_interval_seconds": 0,
+            "effective_min_interval_seconds": 0, "pacing_mode": "auto",
+            "next_fresh_call_in_seconds": 0, "cache_ttl_s": 0,
+            "input_tokens_today": 0, "output_tokens_today": 0,
+            "estimated_cost_usd_today": 0.0, "model": None,
         }
     return adapter.usage_status()
 
@@ -145,7 +183,15 @@ def set_risk_budget(max_calls_per_hour: int):
     adapter = _ACTIVE_ADAPTER
     if adapter is None:
         raise RuntimeError("AI risk adapter not ready")
-    return adapter.set_budget(max_calls_per_hour)
+    return adapter.set_policy(max_calls_per_hour=max_calls_per_hour)
+
+
+def set_risk_policy(max_calls_per_hour=None, min_interval_seconds=None):
+    adapter = _ACTIVE_ADAPTER
+    if adapter is None:
+        raise RuntimeError("AI risk adapter not ready")
+    return adapter.set_policy(max_calls_per_hour=max_calls_per_hour,
+                              min_interval_seconds=min_interval_seconds)
 
 
 def make_openai_risk_adapter(state=None):
@@ -167,6 +213,11 @@ def make_openai_risk_adapter(state=None):
             budget = 20
         budget = max(0, min(budget, 500))
         goals["ai_risk_max_calls_per_hour"] = budget
+        try:
+            pace_override = int(goals.get("ai_risk_min_interval_seconds", 0))
+        except Exception:
+            pace_override = 0
+        goals["ai_risk_min_interval_seconds"] = max(0, min(pace_override, 3600))
         state.goals = goals
     else:
         budget = max(0, min(int(os.environ.get("TERN_AI_RISK_MAX_CALLS_PER_HOUR", "20")), 500))
@@ -193,10 +244,11 @@ def make_openai_risk_adapter(state=None):
     def usage_status():
         with _LOCK:
             u = _usage_dict(state, model)
-            max_calls = int((getattr(state, "goals", {}) or {}).get("ai_risk_max_calls_per_hour", budget)) if state is not None else budget
-            max_calls = max(0, min(max_calls, 500))
-            now = time.monotonic()
-            live_cache = sum(1 for item in decision_cache.values() if item[0] > now)
+            max_calls, override, spacing, pacing_mode = _policy_values(state, budget)
+            now_mono = time.monotonic()
+            live_cache = sum(1 for item in decision_cache.values() if item[0] > now_mono)
+            elapsed = max(0.0, time.time() - float(u.get("last_fresh_call_epoch", 0.0)))
+            next_in = 0 if int(u.get("calls_this_hour", 0)) == 0 else max(0, math.ceil(spacing - elapsed))
             return {
                 "enabled": True, "model": model, "max_calls_per_hour": max_calls,
                 "calls_this_hour": int(u.get("calls_this_hour", 0)),
@@ -206,6 +258,12 @@ def make_openai_risk_adapter(state=None):
                 "cache_hits_today": int(u.get("cache_hits_today", 0)),
                 "budget_bypasses_this_hour": int(u.get("budget_bypasses_this_hour", 0)),
                 "budget_bypasses_today": int(u.get("budget_bypasses_today", 0)),
+                "pace_bypasses_this_hour": int(u.get("pace_bypasses_this_hour", 0)),
+                "pace_bypasses_today": int(u.get("pace_bypasses_today", 0)),
+                "min_interval_seconds": override,
+                "effective_min_interval_seconds": spacing,
+                "pacing_mode": pacing_mode,
+                "next_fresh_call_in_seconds": next_in,
                 "cache_ttl_s": cache_ttl_s, "cached_decisions": live_cache,
                 "input_tokens_today": int(u.get("input_tokens_today", 0)),
                 "output_tokens_today": int(u.get("output_tokens_today", 0)),
@@ -213,23 +271,32 @@ def make_openai_risk_adapter(state=None):
                 "day_utc": u.get("day"), "hour_utc": u.get("hour"),
             }
 
-    def set_budget(value):
+    def set_policy(max_calls_per_hour=None, min_interval_seconds=None):
         if state is None:
-            raise RuntimeError("persistent AI budget requires application state")
-        value = max(0, min(int(value), 500))
+            raise RuntimeError("persistent AI policy requires application state")
         with _LOCK:
             goals = dict(state.goals or {})
-            goals["ai_risk_max_calls_per_hour"] = value
+            if max_calls_per_hour is not None:
+                goals["ai_risk_max_calls_per_hour"] = max(0, min(int(max_calls_per_hour), 500))
+            if min_interval_seconds is not None:
+                goals["ai_risk_min_interval_seconds"] = max(0, min(int(min_interval_seconds), 3600))
             state.goals = goals
             state.save()
         return usage_status()
 
+    def paper_fallback(u, reason_code, counter_prefix):
+        u[counter_prefix + "_this_hour"] = int(u.get(counter_prefix + "_this_hour", 0)) + 1
+        u[counter_prefix + "_today"] = int(u.get(counter_prefix + "_today", 0)) + 1
+        _persist_usage(state, u)
+        return {"verdict": "TAKE", "confidence": 0.0,
+                "reason_code": reason_code, "expiry_horizon_s": 0}
+
     def adapter(facts: dict) -> dict:
         key_hash = _cache_key(facts)
-        now = time.monotonic()
+        now_mono = time.monotonic()
         with _LOCK:
             cached = decision_cache.get(key_hash)
-            if cached and cached[0] > now:
+            if cached and cached[0] > now_mono:
                 u = _usage_dict(state, model)
                 u["cache_hits_this_hour"] = int(u.get("cache_hits_this_hour", 0)) + 1
                 u["cache_hits_today"] = int(u.get("cache_hits_today", 0)) + 1
@@ -239,24 +306,28 @@ def make_openai_risk_adapter(state=None):
                 decision_cache.pop(key_hash, None)
 
             u = _usage_dict(state, model)
-            max_calls = int((getattr(state, "goals", {}) or {}).get("ai_risk_max_calls_per_hour", budget)) if state is not None else budget
-            max_calls = max(0, min(max_calls, 500))
+            max_calls, _override, spacing, _pacing_mode = _policy_values(state, budget)
+            paper = state is not None and str(getattr(state, "mode", "")).upper() == "PAPER"
+
             if int(u.get("calls_this_hour", 0)) >= max_calls:
-                # PAPER is a test environment. Exhausting the OpenAI test allowance must
-                # not freeze simulated trading, so we explicitly preserve the existing
-                # mechanical target and let the independent deterministic gateway decide.
-                # LIVE remains fail-closed.
-                if state is not None and str(getattr(state, "mode", "")).upper() == "PAPER":
-                    u["budget_bypasses_this_hour"] = int(u.get("budget_bypasses_this_hour", 0)) + 1
-                    u["budget_bypasses_today"] = int(u.get("budget_bypasses_today", 0)) + 1
-                    _persist_usage(state, u)
-                    return {"verdict": "TAKE", "confidence": 0.0,
-                            "reason_code": "paper_budget_deterministic_only", "expiry_horizon_s": 0}
+                if paper:
+                    return paper_fallback(u, "paper_budget_deterministic_only", "budget_bypasses")
                 _persist_usage(state, u)
                 return {"verdict": "VETO", "confidence": 0.0,
                         "reason_code": "ai_budget_exhausted", "expiry_horizon_s": 0}
+
+            if int(u.get("calls_this_hour", 0)) > 0:
+                elapsed = max(0.0, time.time() - float(u.get("last_fresh_call_epoch", 0.0)))
+                if elapsed < spacing:
+                    if paper:
+                        return paper_fallback(u, "paper_ai_paced_deterministic_only", "pace_bypasses")
+                    _persist_usage(state, u)
+                    return {"verdict": "VETO", "confidence": 0.0,
+                            "reason_code": "ai_pacing_wait", "expiry_horizon_s": max(0, int(spacing - elapsed))}
+
             u["calls_this_hour"] = int(u.get("calls_this_hour", 0)) + 1
             u["calls_today"] = int(u.get("calls_today", 0)) + 1
+            u["last_fresh_call_epoch"] = time.time()
             _persist_usage(state, u)
 
         body = {
@@ -272,7 +343,7 @@ def make_openai_risk_adapter(state=None):
         }
         req = urllib.request.Request(
             "https://api.openai.com/v1/responses", data=json.dumps(body).encode("utf-8"), method="POST",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "ternary-governed-risk/1.1"},
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "ternary-governed-risk/1.2"},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -314,6 +385,7 @@ def make_openai_risk_adapter(state=None):
     adapter.provider = "openai"
     adapter.model = model
     adapter.usage_status = usage_status
-    adapter.set_budget = set_budget
+    adapter.set_policy = set_policy
+    adapter.set_budget = lambda value: set_policy(max_calls_per_hour=value)
     _ACTIVE_ADAPTER = adapter
     return adapter
