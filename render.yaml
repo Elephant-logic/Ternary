@@ -11,7 +11,7 @@ services:
     buildCommand: python unpack_bundle.py && cp -R overrides/. .render_src/ && cd .render_src && pip install -r requirements.txt && python -m tests.run_all
     # PAPER uses real public 1h spot candles but keeps the simulated broker/fake funds.
     # These flags are start-command scoped so deterministic CI still uses synthetic data.
-    startCommand: cd .render_src && TERN_LIVE_PAPER=1 TERN_PAPER_CANDLE_INTERVAL=1h uvicorn service.paperui:app --host 0.0.0.0 --port $PORT
+    startCommand: cd .render_src && TERN_LIVE_PAPER=1 TERN_PAPER_CANDLE_INTERVAL=1h uvicorn service.paperui2:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: TERN_STATE
