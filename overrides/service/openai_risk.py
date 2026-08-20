@@ -1,9 +1,11 @@
 """Real OpenAI-backed adapter for Ternary's governed AI risk-review seam.
 
-The adapter can only TAKE, REDUCE, DELAY, or VETO. It also applies a persistent
+The adapter can only TAKE, REDUCE, DELAY, or VETO. It applies a persistent
 hourly request budget and an in-memory material-risk cache so repeated reviews of
 the same symbol/side do not waste API calls when the risk picture is effectively
-unchanged. Network/API failures and exhausted budgets fail closed to VETO.
+unchanged. In PAPER mode only, an exhausted test budget explicitly falls back to
+the deterministic mechanical/risk-gateway path without increasing size. LIVE
+mode and API/network failures remain fail-closed.
 """
 from __future__ import annotations
 
@@ -57,12 +59,15 @@ def _usage_dict(state, model: str):
     if u.get("day") != day:
         u.update({
             "day": day, "calls_today": 0, "cache_hits_today": 0,
+            "budget_bypasses_today": 0,
             "input_tokens_today": 0, "output_tokens_today": 0,
             "estimated_cost_usd_today": 0.0,
         })
     if u.get("hour") != hour:
-        u.update({"hour": hour, "calls_this_hour": 0, "cache_hits_this_hour": 0})
+        u.update({"hour": hour, "calls_this_hour": 0, "cache_hits_this_hour": 0,
+                  "budget_bypasses_this_hour": 0})
     for k in ("calls_today", "calls_this_hour", "cache_hits_today", "cache_hits_this_hour",
+              "budget_bypasses_today", "budget_bypasses_this_hour",
               "input_tokens_today", "output_tokens_today"):
         u.setdefault(k, 0)
     u.setdefault("estimated_cost_usd_today", 0.0)
@@ -129,7 +134,8 @@ def risk_usage_status():
         return {
             "enabled": False, "max_calls_per_hour": 0, "calls_this_hour": 0,
             "calls_remaining": 0, "calls_today": 0, "cache_hits_today": 0,
-            "cache_hits_this_hour": 0, "cache_ttl_s": 0, "input_tokens_today": 0,
+            "cache_hits_this_hour": 0, "budget_bypasses_today": 0,
+            "budget_bypasses_this_hour": 0, "cache_ttl_s": 0, "input_tokens_today": 0,
             "output_tokens_today": 0, "estimated_cost_usd_today": 0.0, "model": None,
         }
     return adapter.usage_status()
@@ -198,6 +204,8 @@ def make_openai_risk_adapter(state=None):
                 "calls_today": int(u.get("calls_today", 0)),
                 "cache_hits_this_hour": int(u.get("cache_hits_this_hour", 0)),
                 "cache_hits_today": int(u.get("cache_hits_today", 0)),
+                "budget_bypasses_this_hour": int(u.get("budget_bypasses_this_hour", 0)),
+                "budget_bypasses_today": int(u.get("budget_bypasses_today", 0)),
                 "cache_ttl_s": cache_ttl_s, "cached_decisions": live_cache,
                 "input_tokens_today": int(u.get("input_tokens_today", 0)),
                 "output_tokens_today": int(u.get("output_tokens_today", 0)),
@@ -234,8 +242,19 @@ def make_openai_risk_adapter(state=None):
             max_calls = int((getattr(state, "goals", {}) or {}).get("ai_risk_max_calls_per_hour", budget)) if state is not None else budget
             max_calls = max(0, min(max_calls, 500))
             if int(u.get("calls_this_hour", 0)) >= max_calls:
+                # PAPER is a test environment. Exhausting the OpenAI test allowance must
+                # not freeze simulated trading, so we explicitly preserve the existing
+                # mechanical target and let the independent deterministic gateway decide.
+                # LIVE remains fail-closed.
+                if state is not None and str(getattr(state, "mode", "")).upper() == "PAPER":
+                    u["budget_bypasses_this_hour"] = int(u.get("budget_bypasses_this_hour", 0)) + 1
+                    u["budget_bypasses_today"] = int(u.get("budget_bypasses_today", 0)) + 1
+                    _persist_usage(state, u)
+                    return {"verdict": "TAKE", "confidence": 0.0,
+                            "reason_code": "paper_budget_deterministic_only", "expiry_horizon_s": 0}
                 _persist_usage(state, u)
-                return {"verdict": "VETO", "confidence": 0.0, "reason_code": "ai_budget_exhausted", "expiry_horizon_s": 0}
+                return {"verdict": "VETO", "confidence": 0.0,
+                        "reason_code": "ai_budget_exhausted", "expiry_horizon_s": 0}
             u["calls_this_hour"] = int(u.get("calls_this_hour", 0)) + 1
             u["calls_today"] = int(u.get("calls_today", 0)) + 1
             _persist_usage(state, u)
