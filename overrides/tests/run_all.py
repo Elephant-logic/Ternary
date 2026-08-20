@@ -5,6 +5,7 @@ from tests import test_suite  # noqa: F401
 from tests import test_pipeline  # noqa: F401
 from tests import test_service  # noqa: F401
 from tests import test_json_persistence  # noqa: F401
+from tests import test_live_public  # noqa: F401
 from tests.framework import run
 
 if __name__ == "__main__":
