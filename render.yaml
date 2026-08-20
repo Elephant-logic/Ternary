@@ -9,7 +9,7 @@ services:
     plan: free
     autoDeployTrigger: commit
     buildCommand: python unpack_bundle.py && cp -R overrides/. .render_src/ && cd .render_src && pip install -r requirements.txt && python -m tests.run_all
-    startCommand: cd .render_src && uvicorn service.finalfix:app --host 0.0.0.0 --port $PORT
+    startCommand: cd .render_src && uvicorn service.pnlui:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: TERN_STATE
