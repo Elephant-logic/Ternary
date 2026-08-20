@@ -75,7 +75,14 @@ class EventLog:
     def reconstruct_positions(self):
         pos, cash = {}, None
         for e in self.all():
-            if e.kind == "BALANCE": cash = e.payload.get("cash", cash)
+            if e.kind == "PAPER_ACCOUNT_RESET":
+                # Explicit audited accounting boundary. Historical events remain in
+                # the chain, but positions before this event no longer belong to
+                # the current PAPER price domain.
+                pos = {}
+                cash = float(e.payload.get("cash", cash if cash is not None else 0.0))
+            elif e.kind == "BALANCE":
+                cash = e.payload.get("cash", cash)
             elif e.kind == "FILL":
                 p=e.payload; q=p["qty"]*(1 if p["side"]=="BUY" else -1); pos[p["symbol"]]=pos.get(p["symbol"],0.0)+q
                 if pos[p["symbol"]] <= 1e-12: pos.pop(p["symbol"],None)
