@@ -1,10 +1,9 @@
 """
-Engine assembly + adapter registry (Phase 1/2 seam).
+Engine assembly + adapter registry.
 
-Builds a fully-wired Orchestrator from AppState, choosing data + broker adapters
-by name. Phase 1 ships the synthetic data source + paper broker (no keys). Phase 2
-registers ccxt adapters here — nothing else changes, because everything depends on
-the MarketData / Broker interfaces.
+PAPER can use either deterministic synthetic data (tests/research) or public live
+spot candles while retaining the simulated PaperBroker. LIVE remains a separate
+broker/credential path.
 """
 from __future__ import annotations
 import random
@@ -34,13 +33,24 @@ def _synthetic_store(symbols, n=600, seed=7):
     return HistoricalStore(data, spread_bps=6, depth_frac=0.15)
 
 
+def _public_store(symbols, cfg):
+    from data.live_public import PublicSpotMarketData
+    interval = "1h"
+    if isinstance(cfg.data_source, str) and cfg.data_source.startswith("public:"):
+        interval = cfg.data_source.split(":", 1)[1] or "1h"
+    return PublicSpotMarketData(symbols, interval=interval, limit=600,
+                                cache_seconds=max(10, min(int(cfg.interval_seconds or 60), 30)),
+                                spread_bps=6, depth_frac=0.05)
+
+
 DATA_ADAPTERS = {
     "synthetic": lambda symbols, cfg: _synthetic_store(symbols),
+    "public:*": _public_store,
 }
 
 BROKER_ADAPTERS = {
     "paper": lambda cfg, authority: PaperBroker(authority,
-        SimConfig(fee_rate=0.001, slippage_coeff=0.5, partial_prob=0.15, max_quote_age_ms=7_200_000, latency_ms=50),
+        SimConfig(fee_rate=0.001, slippage_coeff=0.5, partial_prob=0.15, max_quote_age_ms=180_000, latency_ms=50),
         SymbolRules(tick=0.01, lot=1e-5, min_notional=10, liquidity_cap=0.4), seed=9),
 }
 
@@ -76,13 +86,15 @@ def turnover_weighting(turnover: str):
 def build_engine(state: AppState, eventlog: EventLog, ai_adapter=None):
     """Assemble a wired Orchestrator from current state."""
     symbols = state.goals["universe"]
-    limits = GatewayLimits(**goals_to_limits(state.goals))
+    lim = goals_to_limits(state.goals)
+    # Public live PAPER quotes must fail stale much sooner than replay bars.
+    if isinstance(state.data_source, str) and state.data_source.startswith("public:"):
+        lim["max_quote_age_ms"] = 180_000
+    limits = GatewayLimits(**lim)
     authority = ExecutionAuthority()
     gw = RiskGateway(limits, eventlog, authority=authority)
 
-    # Use the real server-side OpenAI risk adapter when the caller did not inject
-    # one. There is no fake TAKE passthrough: if credentials are absent, fail
-    # closed and VETO candidates until the adapter becomes available on restart.
+    # Real server-side OpenAI risk adapter. Missing credentials fail closed.
     if ai_adapter is None:
         from service.openai_risk import make_openai_risk_adapter
         ai_adapter = make_openai_risk_adapter()
