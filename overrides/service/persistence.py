@@ -161,11 +161,17 @@ class RuntimePersistence:
         raw = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
 
-    def save(self, state, eventlog) -> bool:
+    def save(self, state, eventlog, force: bool = False) -> bool:
+        """Save a durable snapshot.
+
+        Routine worker checkpoints remain rate-limited. Critical user actions and
+        fills can pass ``force=True`` so a Render restart immediately afterwards
+        does not roll the PAPER account or settings back to an older snapshot.
+        """
         if not self.remote_enabled:
             return False
         now_ns = time.time_ns()
-        if self.last_saved_ns and self.min_save_seconds:
+        if not force and self.last_saved_ns and self.min_save_seconds:
             if now_ns - self.last_saved_ns < self.min_save_seconds * 1_000_000_000:
                 return True
         try:
