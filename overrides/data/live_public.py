@@ -106,9 +106,11 @@ _PROVIDERS = (("bybit", _bybit), ("kucoin", _kucoin), ("binance", _binance))
 class PublicSpotMarketData:
     """Cached live candle feed implementing Ternary's market-data protocol.
 
-    No inheritance is required: the engine consumes ``bars`` and ``quote_at``
-    structurally. Keeping this adapter dependency-light avoids startup failures
-    caused by implementation-specific interface exports in bundled builds.
+    ``refresh`` creates the market snapshot for the next trading cycle. Once a
+    snapshot exists, ``bars`` and ``quote_at`` read that snapshot only; they never
+    perform network I/O mid-cycle. This preserves the anti-lookahead invariant:
+    an execution quote cannot acquire a timestamp later than the cycle timestamp
+    merely because a cache entry expired while the cycle was running.
     """
     is_live = True
     source_name = "public_spot_candles"
@@ -126,6 +128,8 @@ class PublicSpotMarketData:
         self._fetcher = fetcher
         self._cache = {}
         self._preferred = None
+        self._snapshot_ready = False
+        self._snapshot_ns = None
         self._lock = threading.RLock()
 
     def _fetch(self, symbol: str):
@@ -184,18 +188,41 @@ class PublicSpotMarketData:
                         errors[sym] = row["error"]
                 except Exception as exc:
                     errors[sym] = str(exc)
-        return {"ok": ok, "total": len(self.symbols), "errors": errors, "provider": self._preferred}
+        with self._lock:
+            self._snapshot_ready = True
+            self._snapshot_ns = time.time_ns()
+        return {"ok": ok, "total": len(self.symbols), "errors": errors,
+                "provider": self._preferred, "snapshot_ns": self._snapshot_ns}
+
+    def _snapshot_row(self, symbol: str):
+        s = _norm(symbol)
+        with self._lock:
+            row = self._cache.get(s)
+            ready = self._snapshot_ready
+        if row is not None:
+            return row
+        # Preserve convenient direct use before the worker has created its first
+        # snapshot, but never fetch a missing symbol in the middle of a cycle.
+        if not ready:
+            return self._refresh_symbol(s)
+        return None
 
     def bars(self, symbol: str):
-        s = _norm(symbol)
-        row = self._refresh_symbol(s)
-        return row.get("bars", ())
+        row = self._snapshot_row(symbol)
+        return row.get("bars", ()) if row else ()
 
     def quote_at(self, symbol: str, ts_ns: int):
-        s = _norm(symbol)
-        row = self._refresh_symbol(s)
+        row = self._snapshot_row(symbol)
+        if not row:
+            return None
         bars = row.get("bars") or ()
         if not bars:
+            return None
+        fetched_ns = int(row.get("fetched_ns") or 0)
+        # Do not weaken the future-data guard. If a caller somehow asks for a
+        # quote earlier than the snapshot itself, refuse the quote instead of
+        # clamping or rewriting its timestamp.
+        if fetched_ns and fetched_ns > int(ts_ns):
             return None
         b = bars[-1]
         mid = float(b.close)
@@ -203,7 +230,7 @@ class PublicSpotMarketData:
             return None
         half = mid * (self.spread_bps / 1e4) / 2
         size = max(1e-6, float(b.volume) * self.depth_frac)
-        qts = int(row.get("fetched_ns") or ts_ns)
+        qts = fetched_ns or int(ts_ns)
         return Quote(ts_ns=qts, bid=mid - half, ask=mid + half,
                      bid_size=size, ask_size=size)
 
@@ -212,6 +239,8 @@ class PublicSpotMarketData:
         with self._lock:
             ages = {s: (now - int(r.get("fetched_ns", 0))) / 1e9 for s, r in self._cache.items()}
             errors = {s: r.get("error") for s, r in self._cache.items() if r.get("error")}
+            snapshot_ns = self._snapshot_ns
         return {"source": self.source_name, "interval": self.interval,
                 "provider": self._preferred, "cached": len(ages),
-                "max_age_s": max(ages.values()) if ages else None, "errors": errors}
+                "max_age_s": max(ages.values()) if ages else None,
+                "snapshot_ns": snapshot_ns, "errors": errors}
