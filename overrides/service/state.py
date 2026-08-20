@@ -1,10 +1,9 @@
 """
-Application state & settings (Phase 1).
+Application state & settings.
 
 Holds mode, settings, and goals, persisted as JSON. On ephemeral hosts a remote
-JSON snapshot backend can restore them after a restart. Goals are declarative and get *compiled* into gateway limits +
-optimiser settings (Phase 3 uses this), and every change is written to the
-immutable event log as CONFIG_CHANGE. Safe defaults: PAPER, conservative limits.
+JSON snapshot backend can restore them after a restart. Goals are declarative
+and get compiled into gateway limits + optimiser settings.
 """
 from __future__ import annotations
 import json
@@ -65,8 +64,23 @@ class AppState:
         if os.path.exists(path):
             with open(path) as f: d = json.load(f)
             d["path"] = path
-            return cls(**d)
-        s = cls(path=path); s.save(); return s
+            s = cls(**d)
+        else:
+            s = cls(path=path)
+            s.save()
+        # Render's hosted PAPER profile can opt into real public candles without
+        # affecting deterministic tests/backtests. This is runtime-only policy:
+        # real market data + simulated broker/fake funds.
+        if os.environ.get("TERN_LIVE_PAPER") == "1" and s.mode == "PAPER":
+            interval = os.environ.get("TERN_PAPER_CANDLE_INTERVAL", "1h")
+            if interval not in {"1m","5m","15m","30m","1h","4h","1d","1w"}:
+                interval = "1h"
+            wanted = "public:" + interval
+            if s.data_source != wanted or s.broker != "paper":
+                s.data_source = wanted
+                s.broker = "paper"
+                s.save()
+        return s
 
     def save(self):
         d = asdict(self); d.pop("path", None)
