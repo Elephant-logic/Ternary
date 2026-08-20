@@ -1,7 +1,7 @@
 """Live public spot candles for PAPER trading.
 
 No exchange credentials are used. Candle data are fetched from public spot
-endpoints and converted to Ternary's MarketData interface. The paper broker
+endpoints and converted to Ternary's market-data protocol. The paper broker
 remains simulated; this module only supplies market prices/bars.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from data.store import Bar, MarketData
+from data.store import Bar
 from sim.simulator import Quote
 
 
@@ -32,7 +32,7 @@ _INTERVALS = {
 def _json(url: str, timeout: int = 8):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "ternary-live-paper/1.0", "Accept": "application/json"},
+        headers={"User-Agent": "ternary-live-paper/1.1", "Accept": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -103,12 +103,12 @@ def _binance(symbol: str, interval: str, limit: int) -> list[Bar]:
 _PROVIDERS = (("bybit", _bybit), ("kucoin", _kucoin), ("binance", _binance))
 
 
-class PublicSpotMarketData(MarketData):
-    """Cached live candle feed with provider fallback.
+class PublicSpotMarketData:
+    """Cached live candle feed implementing Ternary's market-data protocol.
 
-    `bars()` returns the latest public candles, including the currently-forming
-    candle. `quote_at()` derives a deterministic top-of-book around that same
-    candle close so PAPER fills and mark-to-market use the same price domain.
+    No inheritance is required: the engine consumes ``bars`` and ``quote_at``
+    structurally. Keeping this adapter dependency-light avoids startup failures
+    caused by implementation-specific interface exports in bundled builds.
     """
     is_live = True
     source_name = "public_spot_candles"
@@ -124,7 +124,7 @@ class PublicSpotMarketData(MarketData):
         self.spread_bps = float(spread_bps)
         self.depth_frac = float(depth_frac)
         self._fetcher = fetcher
-        self._cache = {}       # symbol -> {bars, fetched_ns, provider, error}
+        self._cache = {}
         self._preferred = None
         self._lock = threading.RLock()
 
@@ -170,7 +170,6 @@ class PublicSpotMarketData(MarketData):
             raise
 
     def refresh(self, force=False):
-        """Refresh the configured universe concurrently; returns a health summary."""
         ok, errors = 0, {}
         workers = max(1, min(8, len(self.symbols)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -204,8 +203,6 @@ class PublicSpotMarketData(MarketData):
             return None
         half = mid * (self.spread_bps / 1e4) / 2
         size = max(1e-6, float(b.volume) * self.depth_frac)
-        # Quote age is the age of the successful HTTP refresh, not candle-open age.
-        # This lets the gateway reject genuinely stale network data.
         qts = int(row.get("fetched_ns") or ts_ns)
         return Quote(ts_ns=qts, bid=mid - half, ask=mid + half,
                      bid_size=size, ask_size=size)
