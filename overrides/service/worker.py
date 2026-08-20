@@ -79,23 +79,38 @@ class Worker:
                     "market_health":market_health,
                     "persistence":self.persistence.status() if self.persistence else {"remote_json":False}}
 
+    def _tick_source_ts(self):
+        """Compatibility helper used by existing tests/replay callers.
+
+        It intentionally does not refresh a live market. The live worker loop uses
+        _prepare_tick() so external HTTP is never performed while the control lock
+        is held.
+        """
+        market=self.orch.market
+        if getattr(market,"is_live",False):
+            return int(self._clock())
+        universe=list(self.state.goals.get("universe") or [])
+        if not universe:
+            return None
+        bars=market.bars(universe[0])
+        if not bars:
+            return None
+        return bars[min(60+self._cycle,len(bars)-1)].ts_ns
+
     def _prepare_tick(self):
         """Fetch external market data without holding the control-plane lock."""
         with self._lock:
             market=self.orch.market
-            cycle=self._cycle
-            universe=list(self.state.goals.get("universe") or [])
         if getattr(market,"is_live",False):
             health=market.refresh()
             if int(health.get("ok",0)) <= 0:
                 return market, None, health
             return market, int(self._clock()), health
-        if not universe:
-            return market, None, {}
-        bars=market.bars(universe[0])
-        if not bars:
-            return market, None, {}
-        return market, bars[min(60+cycle,len(bars)-1)].ts_ns, {}
+        # Deterministic/replay sources do no external I/O; retain the historical
+        # helper's semantics for compatibility with the existing suite.
+        with self._lock:
+            ts=self._tick_source_ts()
+        return market, ts, {}
 
     def _loop(self):
         while not self._stop.is_set():
