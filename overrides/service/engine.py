@@ -33,14 +33,46 @@ def _synthetic_store(symbols, n=600, seed=7):
     return HistoricalStore(data, spread_bps=6, depth_frac=0.15)
 
 
+class _UnavailablePublicMarketData:
+    """Boot-safe live feed placeholder.
+
+    This is not a trading fallback and never fabricates prices. It exists only so
+    the HTTP control plane remains available if the public-feed module cannot be
+    imported or initialized. The worker sees zero healthy symbols and stays idle.
+    """
+    is_live = True
+    source_name = "public_spot_unavailable"
+
+    def __init__(self, symbols, interval, error):
+        self.symbols = tuple(symbols)
+        self.interval = interval
+        self.error = str(error)
+
+    def refresh(self, force=False):
+        return {"ok": 0, "total": len(self.symbols), "errors": {"adapter": self.error}, "provider": None}
+
+    def bars(self, symbol):
+        return ()
+
+    def quote_at(self, symbol, ts_ns):
+        return None
+
+    def health(self):
+        return {"source": self.source_name, "interval": self.interval, "provider": None,
+                "cached": 0, "max_age_s": None, "errors": {"adapter": self.error}}
+
+
 def _public_store(symbols, cfg):
-    from data.live_public import PublicSpotMarketData
     interval = "1h"
     if isinstance(cfg.data_source, str) and cfg.data_source.startswith("public:"):
         interval = cfg.data_source.split(":", 1)[1] or "1h"
-    return PublicSpotMarketData(symbols, interval=interval, limit=600,
-                                cache_seconds=max(10, min(int(cfg.interval_seconds or 60), 30)),
-                                spread_bps=6, depth_frac=0.05)
+    try:
+        from data.live_public import PublicSpotMarketData
+        return PublicSpotMarketData(symbols, interval=interval, limit=600,
+                                    cache_seconds=max(10, min(int(cfg.interval_seconds or 60), 30)),
+                                    spread_bps=6, depth_frac=0.05)
+    except Exception as exc:
+        return _UnavailablePublicMarketData(symbols, interval, exc)
 
 
 DATA_ADAPTERS = {
@@ -87,14 +119,12 @@ def build_engine(state: AppState, eventlog: EventLog, ai_adapter=None):
     """Assemble a wired Orchestrator from current state."""
     symbols = state.goals["universe"]
     lim = goals_to_limits(state.goals)
-    # Public live PAPER quotes must fail stale much sooner than replay bars.
     if isinstance(state.data_source, str) and state.data_source.startswith("public:"):
         lim["max_quote_age_ms"] = 180_000
     limits = GatewayLimits(**lim)
     authority = ExecutionAuthority()
     gw = RiskGateway(limits, eventlog, authority=authority)
 
-    # Real server-side OpenAI risk adapter. Missing credentials fail closed.
     if ai_adapter is None:
         from service.openai_risk import make_openai_risk_adapter
         ai_adapter = make_openai_risk_adapter()
