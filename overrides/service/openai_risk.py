@@ -1,21 +1,28 @@
-"""Real OpenAI-backed adapter for the governed AI risk-review seam.
+"""Real OpenAI-backed adapter for Ternary's governed AI risk-review seam.
 
-The adapter is intentionally narrow: it receives frozen mechanical facts and may
-only return TAKE, REDUCE, DELAY, or VETO. Network/API failures and exhausted test
-budgets fail closed to VETO rather than silently passing a trade.
+The adapter can only TAKE, REDUCE, DELAY, or VETO. It also applies a persistent
+hourly request budget and an in-memory material-risk cache so repeated reviews of
+the same symbol/side do not waste API calls when the risk picture is effectively
+unchanged. Network/API failures and exhausted budgets fail closed to VETO.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-
 _ACTIVE_ADAPTER = None
 _LOCK = threading.Lock()
+_VOLATILE_KEYS = {
+    "ts", "ts_ns", "timestamp", "timestamp_ns", "client_id", "order_id",
+    "request_id", "cycle", "event_seq", "event_id",
+}
 
 
 def _extract_text(payload: dict) -> str:
@@ -38,7 +45,6 @@ def _buckets():
 
 
 def _pricing(model: str):
-    # USD per 1M text tokens. Keep unknown models unpriced rather than guessing.
     if model == "gpt-5-mini" or model.startswith("gpt-5-mini-"):
         return 0.25, 2.00
     return None, None
@@ -49,13 +55,16 @@ def _usage_dict(state, model: str):
     goals = getattr(state, "goals", {}) if state is not None else {}
     u = dict(goals.get("ai_usage") or {})
     if u.get("day") != day:
-        u.update({"day": day, "calls_today": 0, "input_tokens_today": 0, "output_tokens_today": 0, "estimated_cost_usd_today": 0.0})
+        u.update({
+            "day": day, "calls_today": 0, "cache_hits_today": 0,
+            "input_tokens_today": 0, "output_tokens_today": 0,
+            "estimated_cost_usd_today": 0.0,
+        })
     if u.get("hour") != hour:
-        u.update({"hour": hour, "calls_this_hour": 0})
-    u.setdefault("calls_today", 0)
-    u.setdefault("calls_this_hour", 0)
-    u.setdefault("input_tokens_today", 0)
-    u.setdefault("output_tokens_today", 0)
+        u.update({"hour": hour, "calls_this_hour": 0, "cache_hits_this_hour": 0})
+    for k in ("calls_today", "calls_this_hour", "cache_hits_today", "cache_hits_this_hour",
+              "input_tokens_today", "output_tokens_today"):
+        u.setdefault(k, 0)
     u.setdefault("estimated_cost_usd_today", 0.0)
     u["model"] = model
     return u
@@ -73,12 +82,56 @@ def _persist_usage(state, usage):
         pass
 
 
+def _round_sig(value: float, sig: int = 3):
+    if not math.isfinite(value) or value == 0:
+        return value
+    return round(value, sig - int(math.floor(math.log10(abs(value)))) - 1)
+
+
+def _normalise_material(value, key: str = ""):
+    """Remove purely volatile identifiers and smooth immaterial numeric noise."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in sorted(value.items(), key=lambda kv: str(kv[0])):
+            ks = str(k)
+            if ks.lower() in _VOLATILE_KEYS:
+                continue
+            out[ks] = _normalise_material(v, ks)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_normalise_material(v, key) for v in value]
+    if isinstance(value, float):
+        return _round_sig(value, 3)
+    return value
+
+
+def _symbol_side(facts: dict):
+    symbol = facts.get("symbol")
+    side = facts.get("side")
+    for nested_key in ("order", "intent", "candidate", "target"):
+        nested = facts.get(nested_key)
+        if isinstance(nested, dict):
+            symbol = symbol or nested.get("symbol")
+            side = side or nested.get("side")
+    return str(symbol or "unknown"), str(side or "unknown").upper()
+
+
+def _cache_key(facts: dict):
+    symbol, side = _symbol_side(facts)
+    material = _normalise_material(facts)
+    raw = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return f"{symbol}|{side}|{hashlib.sha256(raw).hexdigest()}"
+
+
 def risk_usage_status():
     adapter = _ACTIVE_ADAPTER
     if adapter is None:
-        return {"enabled": False, "max_calls_per_hour": 0, "calls_this_hour": 0, "calls_remaining": 0,
-                "calls_today": 0, "input_tokens_today": 0, "output_tokens_today": 0,
-                "estimated_cost_usd_today": 0.0, "model": None}
+        return {
+            "enabled": False, "max_calls_per_hour": 0, "calls_this_hour": 0,
+            "calls_remaining": 0, "calls_today": 0, "cache_hits_today": 0,
+            "cache_hits_this_hour": 0, "cache_ttl_s": 0, "input_tokens_today": 0,
+            "output_tokens_today": 0, "estimated_cost_usd_today": 0.0, "model": None,
+        }
     return adapter.usage_status()
 
 
@@ -94,8 +147,11 @@ def make_openai_risk_adapter(state=None):
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         return None
+
     model = os.environ.get("OPENAI_RISK_MODEL") or os.environ.get("OPENAI_MODEL", "gpt-5-mini")
     timeout_s = max(5, min(int(os.environ.get("OPENAI_RISK_TIMEOUT_S", "30")), 60))
+    cache_ttl_s = max(60, min(int(os.environ.get("TERN_AI_RISK_CACHE_TTL_S", "900")), 3600))
+    decision_cache = {}
 
     if state is not None:
         goals = dict(state.goals or {})
@@ -110,26 +166,22 @@ def make_openai_risk_adapter(state=None):
         budget = max(0, min(int(os.environ.get("TERN_AI_RISK_MAX_CALLS_PER_HOUR", "20")), 500))
 
     schema = {
-        "type": "object",
-        "additionalProperties": False,
+        "type": "object", "additionalProperties": False,
         "properties": {
             "verdict": {"type": "string", "enum": ["TAKE", "REDUCE", "DELAY", "VETO"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "reason_code": {"type": "string", "minLength": 1, "maxLength": 64},
-            "expiry_horizon_s": {"type": "integer", "minimum": 0, "maximum": 86400}
+            "expiry_horizon_s": {"type": "integer", "minimum": 0, "maximum": 86400},
         },
-        "required": ["verdict", "confidence", "reason_code", "expiry_horizon_s"]
+        "required": ["verdict", "confidence", "reason_code", "expiry_horizon_s"],
     }
-
     system = (
-        "You are Ternary's governed risk critic. You review an already-created mechanical "
-        "trade candidate using only the frozen facts supplied. You are not a trading oracle. "
-        "You MUST NOT invent a symbol, create a trade, increase position size, or override "
-        "the independent risk gateway. Your only permitted verdicts are TAKE, REDUCE, DELAY, "
-        "or VETO. TAKE leaves the mechanical size unchanged; REDUCE halves it; DELAY and VETO "
-        "place no order this cycle. Prefer the safer action when facts are weak, contradictory, "
-        "stale, highly exposed, or otherwise uncertain. reason_code must be a short stable "
-        "snake_case label, not prose."
+        "You are Ternary's governed risk critic. Review only the already-created mechanical "
+        "trade candidate using the frozen facts supplied. Never invent a symbol, create a "
+        "trade, increase size, or override the independent risk gateway. Your only verdicts "
+        "are TAKE, REDUCE, DELAY, or VETO. TAKE leaves size unchanged; REDUCE halves it; "
+        "DELAY and VETO place no order this cycle. Prefer the safer action when facts are weak, "
+        "contradictory, stale, highly exposed, or uncertain. reason_code must be short snake_case."
     )
 
     def usage_status():
@@ -137,18 +189,20 @@ def make_openai_risk_adapter(state=None):
             u = _usage_dict(state, model)
             max_calls = int((getattr(state, "goals", {}) or {}).get("ai_risk_max_calls_per_hour", budget)) if state is not None else budget
             max_calls = max(0, min(max_calls, 500))
+            now = time.monotonic()
+            live_cache = sum(1 for item in decision_cache.values() if item[0] > now)
             return {
-                "enabled": True,
-                "model": model,
-                "max_calls_per_hour": max_calls,
+                "enabled": True, "model": model, "max_calls_per_hour": max_calls,
                 "calls_this_hour": int(u.get("calls_this_hour", 0)),
                 "calls_remaining": max(0, max_calls - int(u.get("calls_this_hour", 0))),
                 "calls_today": int(u.get("calls_today", 0)),
+                "cache_hits_this_hour": int(u.get("cache_hits_this_hour", 0)),
+                "cache_hits_today": int(u.get("cache_hits_today", 0)),
+                "cache_ttl_s": cache_ttl_s, "cached_decisions": live_cache,
                 "input_tokens_today": int(u.get("input_tokens_today", 0)),
                 "output_tokens_today": int(u.get("output_tokens_today", 0)),
                 "estimated_cost_usd_today": round(float(u.get("estimated_cost_usd_today", 0.0)), 6),
-                "day_utc": u.get("day"),
-                "hour_utc": u.get("hour"),
+                "day_utc": u.get("day"), "hour_utc": u.get("hour"),
             }
 
     def set_budget(value):
@@ -163,14 +217,25 @@ def make_openai_risk_adapter(state=None):
         return usage_status()
 
     def adapter(facts: dict) -> dict:
+        key_hash = _cache_key(facts)
+        now = time.monotonic()
         with _LOCK:
+            cached = decision_cache.get(key_hash)
+            if cached and cached[0] > now:
+                u = _usage_dict(state, model)
+                u["cache_hits_this_hour"] = int(u.get("cache_hits_this_hour", 0)) + 1
+                u["cache_hits_today"] = int(u.get("cache_hits_today", 0)) + 1
+                _persist_usage(state, u)
+                return dict(cached[1])
+            if cached:
+                decision_cache.pop(key_hash, None)
+
             u = _usage_dict(state, model)
             max_calls = int((getattr(state, "goals", {}) or {}).get("ai_risk_max_calls_per_hour", budget)) if state is not None else budget
             max_calls = max(0, min(max_calls, 500))
             if int(u.get("calls_this_hour", 0)) >= max_calls:
                 _persist_usage(state, u)
                 return {"verdict": "VETO", "confidence": 0.0, "reason_code": "ai_budget_exhausted", "expiry_horizon_s": 0}
-            # Count the request before sending so failures cannot bypass the budget.
             u["calls_this_hour"] = int(u.get("calls_this_hour", 0)) + 1
             u["calls_today"] = int(u.get("calls_today", 0)) + 1
             _persist_usage(state, u)
@@ -179,27 +244,16 @@ def make_openai_risk_adapter(state=None):
             "model": model,
             "input": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": "Frozen risk facts:\n" + json.dumps(facts, sort_keys=True, separators=(",", ":"), default=str)}
+                {"role": "user", "content": "Frozen risk facts:\n" + json.dumps(facts, sort_keys=True, separators=(",", ":"), default=str)},
             ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "ternary_risk_review",
-                    "description": "A bounded Ternary risk decision that can only preserve, reduce, delay, or veto a mechanical order.",
-                    "schema": schema,
-                    "strict": True
-                }
-            }
+            "text": {"format": {
+                "type": "json_schema", "name": "ternary_risk_review",
+                "description": "A bounded Ternary risk decision.", "schema": schema, "strict": True,
+            }},
         }
         req = urllib.request.Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "User-Agent": "ternary-governed-risk/1.0"
-            }
+            "https://api.openai.com/v1/responses", data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "ternary-governed-risk/1.1"},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -208,20 +262,26 @@ def make_openai_risk_adapter(state=None):
             input_tokens = int(api_usage.get("input_tokens", 0) or 0)
             output_tokens = int(api_usage.get("output_tokens", 0) or 0)
             in_rate, out_rate = _pricing(model)
-            with _LOCK:
-                u = _usage_dict(state, model)
-                u["input_tokens_today"] = int(u.get("input_tokens_today", 0)) + input_tokens
-                u["output_tokens_today"] = int(u.get("output_tokens_today", 0)) + output_tokens
-                if in_rate is not None and out_rate is not None:
-                    cost = input_tokens * in_rate / 1_000_000 + output_tokens * out_rate / 1_000_000
-                    u["estimated_cost_usd_today"] = float(u.get("estimated_cost_usd_today", 0.0)) + cost
-                _persist_usage(state, u)
             text = _extract_text(payload)
             if not text:
                 return {"verdict": "VETO", "confidence": 0.0, "reason_code": "ai_empty_response", "expiry_horizon_s": 0}
             obj = json.loads(text)
             if not isinstance(obj, dict):
                 raise ValueError("structured response was not an object")
+            with _LOCK:
+                u = _usage_dict(state, model)
+                u["input_tokens_today"] = int(u.get("input_tokens_today", 0)) + input_tokens
+                u["output_tokens_today"] = int(u.get("output_tokens_today", 0)) + output_tokens
+                if in_rate is not None and out_rate is not None:
+                    u["estimated_cost_usd_today"] = float(u.get("estimated_cost_usd_today", 0.0)) + input_tokens * in_rate / 1_000_000 + output_tokens * out_rate / 1_000_000
+                _persist_usage(state, u)
+                decision_cache[key_hash] = (time.monotonic() + cache_ttl_s, dict(obj))
+                if len(decision_cache) > 500:
+                    expired = [k for k, v in decision_cache.items() if v[0] <= time.monotonic()]
+                    for k in expired:
+                        decision_cache.pop(k, None)
+                    while len(decision_cache) > 500:
+                        decision_cache.pop(next(iter(decision_cache)))
             return obj
         except urllib.error.HTTPError as exc:
             return {"verdict": "VETO", "confidence": 0.0, "reason_code": f"ai_http_{exc.code}", "expiry_horizon_s": 0}
