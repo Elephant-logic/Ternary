@@ -73,6 +73,7 @@ class Worker:
             except Exception as exc:
                 market_health={"error":str(exc)}
             return {"mode":self.state.mode,"live_armed":self.state.live_armed,"running":bool(self._thread and self._thread.is_alive()),
+                    "trading_enabled":bool(self.state.goals.get("trading_enabled",True)),
                     "killed":self.gw.killed,"kill_reason":self.gw.kill_reason,"cycle":self._cycle,**self.last,
                     "positions":{s:round(p["qty"],6) for s,p in self.book.positions.items()},"cash":round(self.book.cash,2),
                     "log_head":self.log.head()[:16],"ai_enabled":self.ai.enabled,"data_source":self.state.data_source,
@@ -101,13 +102,14 @@ class Worker:
         """Fetch external market data without holding the control-plane lock."""
         with self._lock:
             market=self.orch.market
+            trading_enabled=bool(self.state.goals.get("trading_enabled",True))
+        if not trading_enabled:
+            return market, None, {"paused":True}
         if getattr(market,"is_live",False):
             health=market.refresh()
             if int(health.get("ok",0)) <= 0:
                 return market, None, health
             return market, int(self._clock()), health
-        # Deterministic/replay sources do no external I/O; retain the historical
-        # helper's semantics for compatibility with the existing suite.
         with self._lock:
             ts=self._tick_source_ts()
         return market, ts, {}
@@ -118,9 +120,9 @@ class Worker:
                 market,ts,health=self._prepare_tick()
                 if ts is not None:
                     with self._lock:
-                        # Settings may have rebuilt the engine while network IO was
-                        # in flight. Never run a tick against a stale market object.
                         if market is not self.orch.market:
+                            continue
+                        if not self.state.goals.get("trading_enabled",True):
                             continue
                         out=self.orch.run_cycle(ts,self.book); self._cycle+=1
                         self.last={"cycle":self._cycle,"equity":round(out.get("equity",0),2),"halted":out.get("halted",False),"ts":ts,"fills":len(out.get("fills",[])),"drift":out.get("drift",{}),"data_health":health}
