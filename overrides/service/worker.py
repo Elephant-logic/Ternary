@@ -78,6 +78,8 @@ class Worker:
                     "positions":{s:round(p["qty"],6) for s,p in self.book.positions.items()},"cash":round(self.book.cash,2),
                     "log_head":self.log.head()[:16],"ai_enabled":self.ai.enabled,"data_source":self.state.data_source,
                     "market_health":market_health,
+                    "rotation_enabled":bool(self.state.goals.get("rotation_enabled",True)),
+                    "max_exposure_pct":float(self.state.goals.get("max_exposure_pct",0.60)),
                     "persistence":self.persistence.status() if self.persistence else {"remote_json":False}}
 
     def _tick_source_ts(self):
@@ -114,6 +116,14 @@ class Worker:
             ts=self._tick_source_ts()
         return market, ts, {}
 
+    def _publish_runtime_portfolio(self):
+        """Expose a non-persisted book snapshot to the optimiser for this cycle."""
+        self.state._runtime_positions={
+            sym:{"qty":float(pos.get("qty",0.0)),"entry":float(pos.get("entry",0.0) or 0.0)}
+            for sym,pos in self.book.positions.items()
+        }
+        self.state._runtime_cash=float(self.book.cash)
+
     def _loop(self):
         while not self._stop.is_set():
             try:
@@ -124,6 +134,7 @@ class Worker:
                             continue
                         if not self.state.goals.get("trading_enabled",True):
                             continue
+                        self._publish_runtime_portfolio()
                         out=self.orch.run_cycle(ts,self.book); self._cycle+=1
                         self.last={"cycle":self._cycle,"equity":round(out.get("equity",0),2),"halted":out.get("halted",False),"ts":ts,"fills":len(out.get("fills",[])),"drift":out.get("drift",{}),"data_health":health}
                         cp=os.environ.get("TERN_AUDIT_CHECKPOINT_PATH"); ck=os.environ.get("TERN_AUDIT_SIGNING_KEY")
