@@ -19,13 +19,11 @@ class Worker:
         self.orch,self.gw,self.ai=build_engine(self.state,self.log,self.ai_adapter)
 
     def _ensure_live_paper_boundary(self):
-        if self.state.mode != "PAPER" or not getattr(self.orch.market, "is_live", False):
+        if self.state.mode != "PAPER" or getattr(self.orch.market, "source_name", "") != "public_spot_candles":
             return
         events=self.log.all()
         if any(e.kind == "PAPER_ACCOUNT_RESET" and e.payload.get("domain") == self.LIVE_PAPER_DOMAIN for e in events):
             return
-        # Preserve the last reported PAPER equity, but do not carry quantities
-        # opened in the synthetic price domain into real-market prices.
         starting=10000.0
         for e in reversed(events):
             if e.kind == "BALANCE":
@@ -80,28 +78,46 @@ class Worker:
                     "log_head":self.log.head()[:16],"ai_enabled":self.ai.enabled,"data_source":self.state.data_source,
                     "market_health":market_health,
                     "persistence":self.persistence.status() if self.persistence else {"remote_json":False}}
-    def _tick_source_ts(self):
-        if getattr(self.orch.market,"is_live",False):
-            health=self.orch.market.refresh()
-            self.last["data_health"]=health
+
+    def _prepare_tick(self):
+        """Fetch external market data without holding the control-plane lock."""
+        with self._lock:
+            market=self.orch.market
+            cycle=self._cycle
+            universe=list(self.state.goals.get("universe") or [])
+        if getattr(market,"is_live",False):
+            health=market.refresh()
             if int(health.get("ok",0)) <= 0:
-                return None
-            return int(self._clock())
-        sym=self.state.goals["universe"][0]; bars=self.orch.market.bars(sym)
-        if not bars: return None
-        return bars[min(60+self._cycle,len(bars)-1)].ts_ns
+                return market, None, health
+            return market, int(self._clock()), health
+        if not universe:
+            return market, None, {}
+        bars=market.bars(universe[0])
+        if not bars:
+            return market, None, {}
+        return market, bars[min(60+cycle,len(bars)-1)].ts_ns, {}
+
     def _loop(self):
         while not self._stop.is_set():
             try:
-                with self._lock:
-                    ts=self._tick_source_ts()
-                    if ts is not None:
+                market,ts,health=self._prepare_tick()
+                if ts is not None:
+                    with self._lock:
+                        # Settings may have rebuilt the engine while network IO was
+                        # in flight. Never run a tick against a stale market object.
+                        if market is not self.orch.market:
+                            continue
                         out=self.orch.run_cycle(ts,self.book); self._cycle+=1
-                        dh=self.last.get("data_health",{})
-                        self.last={"cycle":self._cycle,"equity":round(out.get("equity",0),2),"halted":out.get("halted",False),"ts":ts,"fills":len(out.get("fills",[])),"drift":out.get("drift",{}),"data_health":dh}
+                        self.last={"cycle":self._cycle,"equity":round(out.get("equity",0),2),"halted":out.get("halted",False),"ts":ts,"fills":len(out.get("fills",[])),"drift":out.get("drift",{}),"data_health":health}
                         cp=os.environ.get("TERN_AUDIT_CHECKPOINT_PATH"); ck=os.environ.get("TERN_AUDIT_SIGNING_KEY")
                         if cp and ck: self.log.checkpoint(cp,ck)
                         if self.persistence: self.persistence.save(self.state,self.log)
+                else:
+                    with self._lock:
+                        self.last["data_health"]=health
             except Exception:
-                self.log.append("CONFIG_CHANGE",{"component":"worker","error":traceback.format_exc()[:500]})
+                try:
+                    self.log.append("CONFIG_CHANGE",{"component":"worker","error":traceback.format_exc()[:500]})
+                except Exception:
+                    pass
             self._stop.wait(max(1,self.state.interval_seconds))
