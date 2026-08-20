@@ -141,15 +141,80 @@ def build_engine(state: AppState, eventlog: EventLog, ai_adapter=None):
     data = _resolve(state.data_source, DATA_ADAPTERS, "data")(symbols, state)
     broker = _resolve(state.broker, BROKER_ADAPTERS, "broker")(state, authority)
 
-    maxw = turnover_weighting(state.goals["turnover"])
-    maxpos = state.goals["max_positions"]
+    def _price(symbol):
+        """Use the already-prepared market snapshot; never invent a price."""
+        try:
+            bars = data.bars(symbol)
+            if bars:
+                return float(bars[-1].close)
+        except Exception:
+            pass
+        return 0.0
 
     def optimizer(cands, equity):
-        if not cands:
+        """Rank candidates, respect exposure headroom, and rotate instead of over-buying.
+
+        The worker publishes an ephemeral snapshot of current positions/cash before
+        each cycle. Near the exposure ceiling, the optimiser emits reductions/exits
+        first and additions second. The independent gateway still validates every
+        resulting order and remains the final authority.
+        """
+        if not cands or equity <= 0:
             return []
-        chosen = cands[:maxpos]
-        w = min(maxw, state.goals["max_exposure_pct"] / max(1, len(chosen)))
-        return [Target(s, w) for s in chosen]
+
+        # Preserve deterministic ranking order while removing duplicates.
+        ranked = list(dict.fromkeys(cands))
+        maxpos = max(1, int(state.goals.get("max_positions", 5)))
+        desired = ranked[:maxpos]
+        max_exposure = float(state.goals.get("max_exposure_pct", 0.60))
+        maxw = turnover_weighting(state.goals.get("turnover", "low"))
+        target_w = min(maxw, max_exposure / max(1, len(desired)))
+
+        runtime_positions = getattr(state, "_runtime_positions", {}) or {}
+        runtime_cash = getattr(state, "_runtime_cash", None)
+        held = {s: p for s, p in runtime_positions.items()
+                if float((p or {}).get("qty", 0.0)) > 1e-12}
+
+        try:
+            exposure = max(0.0, (float(equity) - float(runtime_cash)) / float(equity)) if runtime_cash is not None else 0.0
+        except Exception:
+            exposure = 0.0
+
+        rotation_enabled = bool(state.goals.get("rotation_enabled", True))
+        near_cap = exposure >= max_exposure * 0.97
+        if not rotation_enabled or not near_cap or not held:
+            return [Target(s, target_w) for s in desired]
+
+        current_weights = {}
+        for sym, pos in held.items():
+            px = _price(sym)
+            try:
+                current_weights[sym] = max(0.0, float(pos.get("qty", 0.0)) * px / float(equity)) if px > 0 else 0.0
+            except Exception:
+                current_weights[sym] = 0.0
+
+        # Holdings outside the currently highest-ranked desired set are rotation
+        # candidates. Limit exits per cycle so a noisy ranking cannot churn the
+        # whole portfolio at once.
+        exits = [s for s in held if s not in desired]
+        exits.sort(key=lambda s: current_weights.get(s, 0.0))
+        max_rotate = max(1, min(int(state.goals.get("rotation_max_per_cycle", 1)), 3))
+        exits = exits[:max_rotate]
+
+        targets = [Target(s, 0.0) for s in exits]
+
+        # Emit reductions before additions. This makes exposure headroom available
+        # before the gateway evaluates new buys when the orchestrator rebalances.
+        reductions, additions = [], []
+        for sym in desired:
+            t = Target(sym, target_w)
+            if sym in held and current_weights.get(sym, 0.0) > target_w * 1.02:
+                reductions.append(t)
+            else:
+                additions.append(t)
+        targets.extend(reductions)
+        targets.extend(additions)
+        return targets
 
     orch = Orchestrator(market=data, broker=broker, gateway=gw, ai=ai, eventlog=eventlog,
                         signal_fn=strategy_signal, optimizer_fn=optimizer,
