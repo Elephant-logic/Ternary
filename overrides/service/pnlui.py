@@ -50,16 +50,22 @@ def _set_trading(enabled: bool):
     return _trading_state()
 
 
-def _set_ai_budget(value: int):
+def _set_ai_policy(max_calls_per_hour: int, min_interval_seconds: int = 0):
     h = _handles()
     state, log, persistence = h.get("state"), h.get("log"), h.get("persistence")
     if state is None or log is None:
         raise RuntimeError("runtime not ready")
-    value = max(0, min(int(value), 500))
-    status = openai_risk.set_risk_budget(value)
+    max_calls_per_hour = max(0, min(int(max_calls_per_hour), 500))
+    min_interval_seconds = max(0, min(int(min_interval_seconds), 3600))
+    status = openai_risk.set_risk_policy(
+        max_calls_per_hour=max_calls_per_hour,
+        min_interval_seconds=min_interval_seconds,
+    )
     log.append("CONFIG_CHANGE", {
         "component": "ai_risk_budget",
-        "max_calls_per_hour": value,
+        "max_calls_per_hour": max_calls_per_hour,
+        "min_interval_seconds": min_interval_seconds,
+        "pacing_mode": "auto" if min_interval_seconds == 0 else "custom",
     })
     if persistence:
         persistence.save(state, log)
@@ -88,7 +94,7 @@ EXTRA = r'''
   function ensureAICard(){
     var pane=byId('settingsPane');if(!pane||byId('aiBudgetCard'))return;
     var card=document.createElement('div');card.className='card';card.id='aiBudgetCard';
-    card.innerHTML='<div class="section-title">Execution AI test budget</div><div class="k" style="margin-bottom:10px">Limits automatic OpenAI risk-review calls. Chat questions are manual and are not counted here. When the limit is reached, new AI risk reviews fail closed to VETO until the next UTC hour.</div><div class="row"><label style="flex:1;min-width:180px">Max calls / hour<input id="aiBudgetInput" type="number" min="0" max="500" step="1" value="20"></label><button id="saveAiBudgetBtn">Save AI budget</button></div><div id="aiUsageDetail" class="k" style="margin-top:12px">loading…</div>';
+    card.innerHTML='<div class="section-title">Execution AI test budget & pacing</div><div class="k" style="margin-bottom:10px">Fresh OpenAI risk reviews are spread through the hour instead of being spent immediately. Set pacing to 0 for automatic spacing (3600 ÷ calls/hour). Repeated materially-similar candidates may use the cache for free. PAPER continues through deterministic risk checks between AI slots; LIVE remains fail-closed.</div><div class="grid"><label class="field">Max calls / hour<input id="aiBudgetInput" type="number" min="0" max="500" step="1" value="20"></label><label class="field">Minimum seconds between fresh AI calls<input id="aiPaceInput" type="number" min="0" max="3600" step="1" value="0"><span class="k tiny">0 = auto spread across the hour</span></label></div><div class="row" style="margin-top:10px"><button id="saveAiBudgetBtn">Save AI policy</button></div><div id="aiUsageDetail" class="k" style="margin-top:12px">loading…</div>';
     var first=byId('tradingControlCard');if(first&&first.nextSibling)pane.insertBefore(card,first.nextSibling);else pane.appendChild(card);
     byId('saveAiBudgetBtn').onclick=saveAiBudget;
   }
@@ -97,15 +103,18 @@ EXTRA = r'''
   }
   async function refreshAIUsage(){
     try{
-      var u=await jsonFetch('/ai-usage'),d=byId('aiUsageDetail'),i=byId('aiBudgetInput');
+      var u=await jsonFetch('/ai-usage'),d=byId('aiUsageDetail'),i=byId('aiBudgetInput'),p=byId('aiPaceInput');
       if(i&&document.activeElement!==i)i.value=u.max_calls_per_hour;
-      if(d)d.innerHTML='Risk calls: <b>'+u.calls_this_hour+' / '+u.max_calls_per_hour+'</b> this hour · '+u.calls_remaining+' remaining<br>Today UTC: '+u.calls_today+' calls · '+u.input_tokens_today.toLocaleString()+' input tokens · '+u.output_tokens_today.toLocaleString()+' output tokens · estimated cost <b>$'+Number(u.estimated_cost_usd_today||0).toFixed(6)+'</b>';
+      if(p&&document.activeElement!==p)p.value=u.min_interval_seconds||0;
+      if(d)d.innerHTML='Risk calls: <b>'+u.calls_this_hour+' / '+u.max_calls_per_hour+'</b> this hour · '+u.calls_remaining+' remaining<br>Pacing: <b>'+u.pacing_mode+'</b> · one fresh review at most every '+u.effective_min_interval_seconds+'s · next slot in '+u.next_fresh_call_in_seconds+'s<br>Cache hits this hour: '+(u.cache_hits_this_hour||0)+' · paced PAPER passes: '+(u.pace_bypasses_this_hour||0)+' · budget PAPER passes: '+(u.budget_bypasses_this_hour||0)+'<br>Today UTC: '+u.calls_today+' calls · '+u.input_tokens_today.toLocaleString()+' input tokens · '+u.output_tokens_today.toLocaleString()+' output tokens · estimated cost <b>$'+Number(u.estimated_cost_usd_today||0).toFixed(6)+'</b>';
     }catch(e){var d=byId('aiUsageDetail');if(d)d.textContent='AI usage unavailable: '+e.message}
   }
   async function saveAiBudget(){
     if(!controlToken()){if(typeof flash==='function')flash('Unlock Settings with TERN_CONTROL_TOKEN first.',true);return}
-    var v=parseInt(byId('aiBudgetInput').value,10);if(!Number.isFinite(v)||v<0||v>500){if(typeof flash==='function')flash('AI budget must be between 0 and 500 calls/hour.',true);return}
-    try{await jsonFetch('/ai-budget',{method:'POST',headers:{'Authorization':'Bearer '+controlToken(),'Content-Type':'application/json'},body:JSON.stringify({max_calls_per_hour:v})});if(typeof flash==='function')flash('Execution AI budget saved.');refreshAIUsage()}catch(e){if(typeof flash==='function')flash(e.message,true)}
+    var v=parseInt(byId('aiBudgetInput').value,10),p=parseInt(byId('aiPaceInput').value,10);
+    if(!Number.isFinite(v)||v<0||v>500){if(typeof flash==='function')flash('AI budget must be between 0 and 500 calls/hour.',true);return}
+    if(!Number.isFinite(p)||p<0||p>3600){if(typeof flash==='function')flash('AI pacing must be 0 to 3600 seconds. 0 means automatic.',true);return}
+    try{await jsonFetch('/ai-budget',{method:'POST',headers:{'Authorization':'Bearer '+controlToken(),'Content-Type':'application/json'},body:JSON.stringify({max_calls_per_hour:v,min_interval_seconds:p})});if(typeof flash==='function')flash('Execution AI budget and pacing saved.');refreshAIUsage()}catch(e){if(typeof flash==='function')flash(e.message,true)}
   }
   async function setTrading(on){
     if(!controlToken()){if(typeof flash==='function')flash('Unlock Settings with TERN_CONTROL_TOKEN first.',true);return}
@@ -138,7 +147,7 @@ EXTRA = r'''
       var age=(mh.max_age_s===null||mh.max_age_s===undefined)?'n/a':Number(mh.max_age_s).toFixed(0)+'s';
       m.textContent='PAPER market: '+(s.data_source||'unknown')+' · provider '+(mh.provider||'connecting')+' · data age '+age+(mh.errors&&Object.keys(mh.errors).length?' · partial errors '+Object.keys(mh.errors).length:'');
       box.appendChild(m);
-      try{var u=await jsonFetch('/ai-usage'),a=document.createElement('div');a.id='aiBudgetLine';a.className='k';a.textContent='Execution AI budget: '+u.calls_this_hour+'/'+u.max_calls_per_hour+' this hour · '+u.calls_remaining+' left · today ~$'+Number(u.estimated_cost_usd_today||0).toFixed(4);box.appendChild(a)}catch(e){}
+      try{var u=await jsonFetch('/ai-usage'),a=document.createElement('div');a.id='aiBudgetLine';a.className='k';a.textContent='Execution AI: '+u.calls_this_hour+'/'+u.max_calls_per_hour+' calls · pace '+u.effective_min_interval_seconds+'s · next '+u.next_fresh_call_in_seconds+'s · today ~$'+Number(u.estimated_cost_usd_today||0).toFixed(4);box.appendChild(a)}catch(e){}
       lastEq=eq; lastCycle=s.cycle;
       refreshTradingState(); refreshAIUsage();
     }catch(e){}
@@ -177,7 +186,10 @@ async def app(scope, receive, send):
                     if not message.get("more_body"):
                         break
                 payload = json.loads(body.decode("utf-8") or "{}")
-                response = JSONResponse(_set_ai_budget(payload.get("max_calls_per_hour", 20)))
+                response = JSONResponse(_set_ai_policy(
+                    payload.get("max_calls_per_hour", 20),
+                    payload.get("min_interval_seconds", 0),
+                ))
             except Exception as exc:
                 response = JSONResponse({"error": str(exc)}, status_code=400)
             return await response(scope, receive, send)
