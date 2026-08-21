@@ -11,7 +11,7 @@ services:
     buildCommand: python unpack_bundle.py && cp -R overrides/. .render_src/ && cd .render_src && pip install -r requirements.txt && python -m tests.run_all
     # PAPER uses real public 1h spot candles but keeps the simulated broker/fake funds.
     # These flags are start-command scoped so deterministic CI still uses synthetic data.
-    startCommand: cd .render_src && TERN_LIVE_PAPER=1 TERN_PAPER_CANDLE_INTERVAL=1h uvicorn service.paperui3:app --host 0.0.0.0 --port $PORT
+    startCommand: cd .render_src && TERN_LIVE_PAPER=1 TERN_PAPER_CANDLE_INTERVAL=1h uvicorn service.binanceui:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: TERN_STATE
@@ -45,8 +45,12 @@ services:
       - key: OPENAI_MODEL
         value: gpt-5-mini
 
-      # LIVE credentials intentionally remain unset for this PAPER/free profile.
-      # - key: TERN_LIVE_API_KEY
-      #   sync: false
-      # - key: TERN_LIVE_API_SECRET
-      #   sync: false
+      # Binance account connection. These remain server-side Render secrets.
+      # The dashboard only receives read-only account summaries; no credential
+      # value is returned to the browser or stored in the runtime JSON snapshot.
+      - key: BINANCE_API_BASE
+        value: https://api.binance.com
+      - key: TERN_LIVE_API_KEY
+        sync: false
+      - key: TERN_LIVE_API_SECRET
+        sync: false
